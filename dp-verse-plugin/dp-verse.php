@@ -521,9 +521,12 @@ function dp_verse_publish_next() {
 	dp_verse_log( "Text API call successful. Response received: " . substr( $gemini_response_text, 0, 200 ) . '...' );
 
 	// --- 6. Prepare and Call Image API ---
+	// Add the text response to the replacements array *before* creating the image prompt
+	$replacements['{response}'] = $gemini_response_text;
+
 	$image_prompt = str_replace(
-		array_keys( $replacements ) + array( '{response}' => $gemini_response_text ),
-		array_values( $replacements ) + array( '{response}' => $gemini_response_text ), // Add response to replacements
+		array_keys( $replacements ),
+		array_values( $replacements ),
 		$image_prompt_template
 	);
 	dp_verse_log( "Prepared Image Prompt: " . substr( $image_prompt, 0, 200 ) . '...' );
