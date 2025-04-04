@@ -140,9 +140,18 @@ function dp_verse_render_options_page() {
 			<?php wp_nonce_field( 'dp_verse_view_logs_nonce', 'dp_verse_view_logs_nonce_field' ); ?>
 			<?php submit_button( __( 'View Logs', 'daily-dhammapada' ), 'secondary', 'dp_verse_view_logs_button', false ); ?>
 		</form>
+		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" style="display: inline-block;">
+			<input type="hidden" name="action" value="dp_verse_clear_logs_action">
+			<?php wp_nonce_field( 'dp_verse_clear_logs_nonce', 'dp_verse_clear_logs_nonce_field' ); ?>
+			<?php submit_button( __( 'Clear Log File', 'daily-dhammapada' ), 'delete', 'dp_verse_clear_logs_button', false, array( 'onclick' => 'return confirm("' . __( 'Are you sure you want to delete the debug log file?', 'daily-dhammapada' ) . '");' ) ); ?>
+		</form>
+
 		<?php // Display log content if requested
+			// Display admin notices (like success/error messages from button actions)
+			settings_errors('dp_verse_settings'); // Use the setting group name
+
 			if ( isset( $_GET['view_logs'] ) && $_GET['view_logs'] === 'true' && current_user_can( 'manage_options' ) ) {
-				echo '<h2>' . __( 'Debug Log', 'daily-dhammapada' ) . '</h2>';
+				echo '<h2 style="margin-top: 20px;">' . __( 'Debug Log (Last 100 lines)', 'daily-dhammapada' ) . '</h2>';
 				$log_file = DP_VERSE_LOG_DIR . '/debug.log';
 				if ( file_exists( $log_file ) && is_readable( $log_file ) ) {
 					// Read last N lines (e.g., 100)
@@ -485,6 +494,7 @@ function dp_verse_publish_next() {
 	);
 
 	dp_verse_log( "Making Text API call to: {$text_api_url}" );
+	dp_verse_log( "Text API Request Body: " . $text_api_body ); // Log request body
 	$text_response = wp_remote_post( $text_api_url, $text_api_args );
 
 	if ( is_wp_error( $text_response ) ) {
@@ -494,10 +504,16 @@ function dp_verse_publish_next() {
 
 	$text_response_code = wp_remote_retrieve_response_code( $text_response );
 	$text_response_body = wp_remote_retrieve_body( $text_response );
+	dp_verse_log( "Text API Raw Response (HTTP {$text_response_code}): " . $text_response_body ); // Log raw response body
 	$text_data = json_decode( $text_response_body, true );
 
-	if ( $text_response_code !== 200 || empty( $text_data['candidates'][0]['content']['parts'][0]['text'] ) ) {
-		dp_verse_log( "Error calling Text API (HTTP {$text_response_code}): " . $text_response_body );
+	// Check specifically for the expected structure after logging the raw response
+	if ( $text_response_code !== 200 || ! isset( $text_data['candidates'][0]['content']['parts'][0]['text'] ) ) {
+		dp_verse_log( "Error processing Text API response. Code: {$text_response_code}. See raw response above." );
+		// Check for specific error messages from Gemini if available
+        if (isset($text_data['error']['message'])) {
+            dp_verse_log("Gemini API Error Message: " . $text_data['error']['message']);
+        }
 		return false;
 	}
 
@@ -512,16 +528,19 @@ function dp_verse_publish_next() {
 	);
 	dp_verse_log( "Prepared Image Prompt: " . substr( $image_prompt, 0, 200 ) . '...' );
 
-	// Note: The specific Image API endpoint and request body structure might differ.
-	// Using the example structure provided in the initial notes.
-	// You might need to adjust the model name (e.g., 'imagen-3.0-generate-002') and body structure based on the actual Gemini Image API documentation.
-	$image_api_url = "https://generativelanguage.googleapis.com/v1beta/models/imagen-3.0-generate-002:predict?key={$api_key}"; // Example endpoint
+	// Using the generateContent endpoint for image generation as per the new example.
+	// Model name might need adjustment based on availability/updates.
+	$image_api_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp-image-generation:generateContent?key={$api_key}"; // Updated Endpoint
 	$image_api_body = wp_json_encode( array(
-		'instances' => array(
-			array( 'prompt' => $image_prompt )
+		'contents' => array(
+			array(
+				'parts' => array(
+					array( 'text' => $image_prompt ) // Send the prepared image prompt
+				)
+			)
 		),
-		'parameters' => array(
-			'numberOfImages' => 1 // Request only one image
+		'generationConfig' => array(
+			'responseModalities' => array('Text', 'Image') // Exact format required for image generation
 		)
 	) );
 
@@ -533,79 +552,75 @@ function dp_verse_publish_next() {
 	);
 
 	dp_verse_log( "Making Image API call to: {$image_api_url}" );
+	dp_verse_log( "Image API Request Body: " . $image_api_body ); // Log request body
 	$image_response = wp_remote_post( $image_api_url, $image_api_args );
-	$image_url = null;
 	$attachment_id = null;
 
 	if ( is_wp_error( $image_response ) ) {
 		dp_verse_log( 'Error calling Image API (WP_Error): ' . $image_response->get_error_message() );
-		// Continue without image if API fails? Or return false? Decide based on requirements.
-		// For now, we'll log the error and proceed without an image.
+		// Proceed without image
 	} else {
 		$image_response_code = wp_remote_retrieve_response_code( $image_response );
 		$image_response_body = wp_remote_retrieve_body( $image_response );
+		dp_verse_log( "Image API Raw Response (HTTP {$image_response_code}): " . $image_response_body ); // Log raw response body
 		$image_data = json_decode( $image_response_body, true );
 
 		// --- 7. Handle Image Response ---
-		// Adjust the path based on the actual API response structure for the image URL or base64 data
-		if ( $image_response_code === 200 && ! empty( $image_data['predictions'][0]['url'] ) ) { // Example: Check for URL
-			$image_url = $image_data['predictions'][0]['url'];
-			dp_verse_log( "Image API call successful. Image URL received: {$image_url}" );
+		// The new endpoint returns Base64 data directly in candidates[0].content.parts[0].inlineData.data
+		if ( $image_response_code === 200 && ! empty( $image_data['candidates'][0]['content']['parts'][0]['inlineData']['data'] ) ) {
+			dp_verse_log( "Image API call successful. Received Base64 image data." );
+			$image_base64 = $image_data['candidates'][0]['content']['parts'][0]['inlineData']['data'];
+			$image_mime_type = isset( $image_data['candidates'][0]['content']['parts'][0]['inlineData']['mimeType'] ) ? $image_data['candidates'][0]['content']['parts'][0]['inlineData']['mimeType'] : 'image/png'; // Default to png
+            $image_extension = strpos($image_mime_type, 'jpeg') !== false ? 'jpg' : 'png'; // Determine extension
 
-			// Download image and attach to media library
-			require_once( ABSPATH . 'wp-admin/includes/media.php' );
-			require_once( ABSPATH . 'wp-admin/includes/file.php' );
-			require_once( ABSPATH . 'wp-admin/includes/image.php' );
+            $image_data_decoded = base64_decode( $image_base64 );
 
-			// Sideload the image (downloads and attaches)
-			// Use verse number in description for clarity
-			$image_desc = "Dhammapada Verse " . $next_verse_number;
-			$attachment_id = media_sideload_image( $image_url, 0, $image_desc, 'id' ); // Download to media library, get attachment ID
-
-			if ( is_wp_error( $attachment_id ) ) {
-				dp_verse_log( "Error sideloading image (WP_Error): " . $attachment_id->get_error_message() );
-				$attachment_id = null; // Reset attachment ID on error
+			if ( $image_data_decoded === false ) {
+				dp_verse_log( "Error decoding Base64 image data." );
 			} else {
-				dp_verse_log( "Image successfully sideloaded. Attachment ID: {$attachment_id}" );
-			}
-		} elseif ( $image_response_code === 200 && ! empty( $image_data['predictions'][0]['bytesBase64Encoded'] ) ) { // Example: Check for Base64 data
-            dp_verse_log( "Image API call successful. Received Base64 image data." );
-            $image_base64 = $image_data['predictions'][0]['bytesBase64Encoded'];
-            $image_data_decoded = base64_decode($image_base64);
+				// Need to save the decoded data to a temporary file to use media_handle_sideload
+				$upload_dir = wp_upload_dir();
+                $filename = 'gemini-image-' . $next_verse_number . '-' . time() . '.' . $image_extension; // Unique filename
+                $tmp_path = trailingslashit( $upload_dir['path'] ) . $filename; // Save in uploads temporarily
 
-            if ($image_data_decoded === false) {
-                dp_verse_log( "Error decoding Base64 image data." );
-            } else {
-                // Need to save the decoded data to a temporary file to use media_sideload_image equivalent
-                $tmp = tmpfile();
-                fwrite($tmp, $image_data_decoded);
-                $tmp_path = stream_get_meta_data($tmp)['uri'];
-
-                // Prepare file array for media_handle_sideload
-                $file_array = array(
-                    'name'     => 'gemini-image-' . $next_verse_number . '.jpg', // Example filename
-                    'tmp_name' => $tmp_path,
-                );
-
-                require_once( ABSPATH . 'wp-admin/includes/media.php' );
-                require_once( ABSPATH . 'wp-admin/includes/file.php' );
-                require_once( ABSPATH . 'wp-admin/includes/image.php' );
-
-                $image_desc = "Dhammapada Verse " . $next_verse_number;
-                // media_handle_sideload expects a $_FILES-like array
-                $attachment_id = media_handle_sideload( $file_array, 0, $image_desc );
-
-                fclose($tmp); // Close and delete the temporary file
-
-                if ( is_wp_error( $attachment_id ) ) {
-                    dp_verse_log( "Error handling sideloaded Base64 image (WP_Error): " . $attachment_id->get_error_message() );
-                    $attachment_id = null;
+                if ( file_put_contents( $tmp_path, $image_data_decoded ) === false ) {
+                    dp_verse_log( "Error saving decoded image data to temporary file: {$tmp_path}" );
                 } else {
-                    dp_verse_log( "Base64 Image successfully handled. Attachment ID: {$attachment_id}" );
+                    dp_verse_log( "Decoded image saved temporarily to: {$tmp_path}" );
+                    // Prepare file array for media_handle_sideload
+                    $file_array = array(
+                        'name'     => $filename,
+                        'tmp_name' => $tmp_path,
+                    );
+
+                    require_once( ABSPATH . 'wp-admin/includes/media.php' );
+                    require_once( ABSPATH . 'wp-admin/includes/file.php' );
+                    require_once( ABSPATH . 'wp-admin/includes/image.php' );
+
+                    $image_desc = "Dhammapada Verse " . $next_verse_number;
+                    // media_handle_sideload expects a $_FILES-like array, moves the file
+                    $attachment_id = media_handle_sideload( $file_array, 0, $image_desc );
+
+                    // Check if media_handle_sideload failed (it deletes the tmp file on success)
+                    if ( is_wp_error( $attachment_id ) ) {
+                        dp_verse_log( "Error handling sideloaded Base64 image (WP_Error): " . $attachment_id->get_error_message() );
+                        $attachment_id = null;
+                        // Clean up temp file if sideload failed and file still exists
+                        if ( file_exists( $tmp_path ) ) {
+                            unlink( $tmp_path );
+                        }
+                    } else {
+                        dp_verse_log( "Base64 Image successfully handled. Attachment ID: {$attachment_id}" );
+                        // Temp file is automatically removed by media_handle_sideload on success
+                    }
                 }
+			}
+		} else {
+			dp_verse_log( "Error processing Image API response. Code: {$image_response_code}. See raw response above." );
+			// Check for specific error messages from Gemini if available
+            if (isset($image_data['error']['message'])) {
+                dp_verse_log("Gemini API Error Message: " . $image_data['error']['message']);
             }
-        } else {
-			dp_verse_log( "Error calling Image API (HTTP {$image_response_code}): " . $image_response_body );
 			// Proceed without image
 		}
 	}
@@ -773,9 +788,59 @@ function dp_verse_handle_view_logs() {
 }
 add_action( 'admin_post_dp_verse_view_logs_action', 'dp_verse_handle_view_logs' );
 
-// Optional: Add handler for clearing logs if button is added
-// add_action( 'admin_post_dp_verse_clear_logs_action', 'dp_verse_handle_clear_logs' );
-// function dp_verse_handle_clear_logs() { ... check nonce, caps, unlink log file, redirect ... }
+/**
+ * Handles the 'Clear Log File' button submission.
+ */
+function dp_verse_handle_clear_logs() {
+	// Verify nonce
+	if ( ! isset( $_POST['dp_verse_clear_logs_nonce_field'] ) || ! wp_verify_nonce( $_POST['dp_verse_clear_logs_nonce_field'], 'dp_verse_clear_logs_nonce' ) ) {
+		wp_die( __( 'Security check failed!', 'daily-dhammapada' ) );
+	}
+
+	// Check user capabilities
+	if ( ! current_user_can( 'manage_options' ) ) {
+		wp_die( __( 'You do not have sufficient permissions to perform this action.', 'daily-dhammapada' ) );
+	}
+
+	$log_file = DP_VERSE_LOG_DIR . '/debug.log';
+
+	if ( file_exists( $log_file ) ) {
+		if ( unlink( $log_file ) ) {
+			// Success
+			add_settings_error(
+				'dp_verse_settings',
+				'dp_verse_clear_logs_success',
+				__( 'Debug log file cleared successfully.', 'daily-dhammapada' ),
+				'success'
+			);
+			dp_verse_log( 'Debug log file cleared by user.' ); // Log the action itself (will create a new file)
+		} else {
+			// Failure
+			add_settings_error(
+				'dp_verse_settings',
+				'dp_verse_clear_logs_error',
+				__( 'Failed to clear the debug log file. Check file permissions.', 'daily-dhammapada' ),
+				'error'
+			);
+		}
+	} else {
+		// Log file doesn't exist
+		add_settings_error(
+			'dp_verse_settings',
+			'dp_verse_clear_logs_notice',
+			__( 'Debug log file does not exist.', 'daily-dhammapada' ),
+			'info'
+		);
+	}
+
+	// Store the notices so they survive the redirect
+	set_transient( 'settings_errors', get_settings_errors(), 30 );
+
+	// Redirect back to the settings page (without the view_logs param)
+	wp_safe_redirect( admin_url( 'options-general.php?page=dp_verse_settings' ) );
+	exit;
+}
+add_action( 'admin_post_dp_verse_clear_logs_action', 'dp_verse_handle_clear_logs' );
 
 
 ?>
