@@ -214,6 +214,14 @@ function dp_verse_register_settings() {
 	);
 
 	add_settings_field(
+		'summary_prompt_template',
+		__( 'Summary Prompt Template', 'daily-dhammapada' ),
+		'dp_verse_summary_prompt_template_render',
+		'dp_verse_settings',
+		'dp_verse_prompt_templates_section'
+	);
+
+	add_settings_field(
 		'image_prompt_template',
 		__( 'Image Prompt Template', 'daily-dhammapada' ),
 		'dp_verse_image_prompt_template_render',
@@ -272,7 +280,9 @@ function dp_verse_api_settings_section_callback() {
 
 function dp_verse_prompt_templates_section_callback() {
 	echo '<p>' . __( 'Define the templates used to generate content via the Gemini API.', 'daily-dhammapada' ) . '</p>';
-	echo '<p>' . __( 'Available variables: <code>{number}</code>, <code>{pali_verse}</code>, <code>{english_verse}</code>. The Image Prompt also gets <code>{response}</code> (the text generated from the Text Prompt).', 'daily-dhammapada' ) . '</p>';
+	echo '<p>' . __( 'Available variables for all templates: <code>{number}</code>, <code>{pali_verse}</code>, <code>{english_verse}</code>.', 'daily-dhammapada' ) . '</p>';
+	echo '<p>' . __( 'The Summary Prompt Template also gets <code>{response}</code> (the text generated from the Text Prompt).', 'daily-dhammapada' ) . '</p>';
+	echo '<p>' . __( 'The Image Prompt Template gets <code>{response}</code> and <code>{summary}</code> (the text generated from the Summary Prompt).', 'daily-dhammapada' ) . '</p>';
 }
 
 function dp_verse_html_templates_section_callback() {
@@ -297,6 +307,13 @@ function dp_verse_text_prompt_template_render() {
 	$options = get_option( 'dp_verse_settings' );
 	?>
 	<textarea name='dp_verse_settings[text_prompt_template]' rows='5' cols='50' class='large-text code'><?php echo isset( $options['text_prompt_template'] ) ? esc_textarea( $options['text_prompt_template'] ) : ''; ?></textarea>
+	<?php
+}
+
+function dp_verse_summary_prompt_template_render() {
+	$options = get_option( 'dp_verse_settings' );
+	?>
+	<textarea name='dp_verse_settings[summary_prompt_template]' rows='5' cols='50' class='large-text code'><?php echo isset( $options['summary_prompt_template'] ) ? esc_textarea( $options['summary_prompt_template'] ) : ''; ?></textarea>
 	<?php
 }
 
@@ -349,6 +366,10 @@ function dp_verse_sanitize_settings( $input ) {
 	if ( isset( $input['text_prompt_template'] ) ) {
 		// Allow some basic HTML and template tags
 		$sanitized_input['text_prompt_template'] = wp_kses_post( $input['text_prompt_template'] ); // Allows basic HTML, good for templates
+	}
+
+	if ( isset( $input['summary_prompt_template'] ) ) {
+		$sanitized_input['summary_prompt_template'] = wp_kses_post( $input['summary_prompt_template'] );
 	}
 
 	if ( isset( $input['image_prompt_template'] ) ) {
@@ -475,7 +496,7 @@ function dp_verse_publish_next() {
 	dp_verse_log( "Prepared Text Prompt: " . substr( $text_prompt, 0, 200 ) . '...' ); // Log truncated prompt
 
 	// --- 5. Gemini Text API Call ---
-	$text_api_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={$api_key}"; // Using 1.5 Flash as example
+	$text_api_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro-exp-03-25:generateContent?key={$api_key}"; // Using 1.5 Flash as example
 	$text_api_body = wp_json_encode( array(
 		'contents' => array(
 			array(
@@ -520,9 +541,73 @@ function dp_verse_publish_next() {
 	$gemini_response_text = $text_data['candidates'][0]['content']['parts'][0]['text'];
 	dp_verse_log( "Text API call successful. Response received: " . substr( $gemini_response_text, 0, 200 ) . '...' );
 
-	// --- 6. Prepare and Call Image API ---
-	// Add the text response to the replacements array *before* creating the image prompt
+	// --- 6. Prepare and Call Summary API ---
+	$summary_prompt_template = isset( $options['summary_prompt_template'] ) ? $options['summary_prompt_template'] : '';
+	
+	// Skip summary generation if template is empty
+	$gemini_summary_text = '';
+	if ( ! empty( $summary_prompt_template ) ) {
+		// Add the text response to the replacements array for the summary prompt
+		$replacements['{response}'] = $gemini_response_text;
+		
+		$summary_prompt = str_replace(
+			array_keys( $replacements ),
+			array_values( $replacements ),
+			$summary_prompt_template
+		);
+		dp_verse_log( "Prepared Summary Prompt: " . substr( $summary_prompt, 0, 200 ) . '...' );
+		
+		// Make the Summary API call
+		$summary_api_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro-exp-03-25:generateContent?key={$api_key}";
+		$summary_api_body = wp_json_encode( array(
+			'contents' => array(
+				array(
+					'parts' => array(
+						array( 'text' => $summary_prompt )
+					)
+				)
+			)
+		) );
+		
+		$summary_api_args = array(
+			'method'  => 'POST',
+			'headers' => array( 'Content-Type' => 'application/json' ),
+			'body'    => $summary_api_body,
+			'timeout' => 60,
+		);
+		
+		dp_verse_log( "Making Summary API call to: {$summary_api_url}" );
+		dp_verse_log( "Summary API Request Body: " . $summary_api_body );
+		$summary_response = wp_remote_post( $summary_api_url, $summary_api_args );
+		
+		if ( is_wp_error( $summary_response ) ) {
+			dp_verse_log( 'Error calling Summary API (WP_Error): ' . $summary_response->get_error_message() );
+			// Continue without summary, will use image prompt without {summary} variable
+		} else {
+			$summary_response_code = wp_remote_retrieve_response_code( $summary_response );
+			$summary_response_body = wp_remote_retrieve_body( $summary_response );
+			dp_verse_log( "Summary API Raw Response (HTTP {$summary_response_code}): " . $summary_response_body );
+			$summary_data = json_decode( $summary_response_body, true );
+			
+			if ( $summary_response_code === 200 && isset( $summary_data['candidates'][0]['content']['parts'][0]['text'] ) ) {
+				$gemini_summary_text = $summary_data['candidates'][0]['content']['parts'][0]['text'];
+				dp_verse_log( "Summary API call successful. Response received: " . substr( $gemini_summary_text, 0, 200 ) . '...' );
+			} else {
+				dp_verse_log( "Error processing Summary API response. Code: {$summary_response_code}. See raw response above." );
+				if ( isset( $summary_data['error']['message'] ) ) {
+					dp_verse_log( "Gemini API Error Message: " . $summary_data['error']['message'] );
+				}
+				// Continue without summary
+			}
+		}
+	} else {
+		dp_verse_log( "Summary prompt template is empty. Skipping summary generation." );
+	}
+
+	// --- 7. Prepare and Call Image API ---
+	// Add the text response and summary to the replacements array for the image prompt
 	$replacements['{response}'] = $gemini_response_text;
+	$replacements['{summary}'] = $gemini_summary_text;
 
 	$image_prompt = str_replace(
 		array_keys( $replacements ),
